@@ -1,0 +1,7 @@
+node_modules/
+.env
+# cache de metadados gerado pelo MikroORM
+.snapshot-*.json
+temp/
+coverage/
+*.log
