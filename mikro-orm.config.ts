@@ -1,5 +1,6 @@
 import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
+import { persistenceEntities } from './src/infrastructure/persistence/entities';
 import { Migration20261110000000_initial_schema } from './src/infrastructure/persistence/migrations/Migration20261110000000_initial_schema';
 
 /**
@@ -15,9 +16,7 @@ export function buildOrmConfig(databaseUrl = process.env.DATABASE_URL) {
 
   return defineConfig({
     clientUrl: databaseUrl,
-    // entidades (EntitySchema) entram nos próximos passos
-    entities: [],
-    discovery: { warnWhenNoEntities: false },
+    entities: persistenceEntities,
     extensions: [Migrator],
     migrations: {
       migrationsList,

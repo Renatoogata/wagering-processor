@@ -1,0 +1,304 @@
+import { WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected, WalletBalanceChanged, type EventContext, type IntegrationEvent } from '../../domain/events';
+import { InboxMessage, OutboxMessage } from '../../domain/messaging';
+import { InvalidCurrencyError, InvalidMoneyAmountError, Money } from '../../domain/money';
+import {
+  FailureCode,
+  InvalidWagerTransactionError,
+  ReferenceRetryPolicy,
+  WagerTransaction,
+  WagerTransactionKind as Kind,
+  WagerTransactionStatus as Status,
+  hashWagerPayload,
+  type WagerPayload,
+} from '../../domain/wagering';
+import { LedgerDirection, type Wallet, type WalletLedgerEntry } from '../../domain/wallet';
+import { BusinessRuleViolationError, InvalidPayloadError, WalletNotFoundError } from '../errors';
+import { ConcurrentWriteConflictError, type TransactionalRepositories, type UnitOfWork } from '../ports/repositories';
+import type { Clock, IdGenerator } from '../ports/system';
+import { replayOrConflict, toResult, type WagerTransactionResult } from './wager-transaction-result';
+
+export interface ProcessWagerTransactionCommand {
+  idempotencyKey: string;
+  payload: WagerPayload;
+  /** rastreabilidade: vai para os eventos da outbox */
+  context: { correlationId: string; causationId?: string };
+  /** presente quando a entrada é a SQS: a inbox é gravada na MESMA transação */
+  inbox?: { consumerName: string; messageId: string };
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Quantas vezes repetir quando duas transações concorrentes colidem numa constraint única. */
+const MAX_CONFLICT_RETRIES = 3;
+
+/**
+ * Caso de uso central: processa uma operação do provedor (BET, WIN, LOSS, REFUND, ROLLBACK).
+ * É o MESMO para HTTP e SQS (seção 10).
+ *
+ * Tudo acontece numa única transação SQL, nesta ordem:
+ *   1. trava a wallet (SELECT ... FOR UPDATE)            ← fila por wallet
+ *   2. idempotência: a key já existe? replay ou conflito ← DEPOIS do lock (ver abaixo)
+ *   3. decide: aplica, rejeita ou deixa pendente
+ *   4. grava transação, saldo, ledger, eventos (outbox) e inbox
+ *   5. commit — só então a resposta sai
+ *
+ * Por que checar a idempotência DEPOIS do lock?
+ * Se fosse antes, duas cópias simultâneas da mesma BET leriam "não existe" ao mesmo
+ * tempo e as duas tentariam debitar. Depois do lock, a segunda só roda quando a
+ * primeira já commitou — e então ENXERGA a transação gravada e vira replay.
+ * E se as cópias apontarem wallets diferentes (payload adulterado)? Não há lock
+ * em comum; a constraint UNIQUE da key barra a segunda, a transação é desfeita
+ * (ConcurrentWriteConflictError) e a nova tentativa cai no caminho de conflito.
+ */
+export class ProcessWagerTransaction {
+  constructor(
+    private readonly uow: UnitOfWork,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+    private readonly referencePolicy: ReferenceRetryPolicy = new ReferenceRetryPolicy(),
+  ) {}
+
+  async execute(command: ProcessWagerTransactionCommand): Promise<WagerTransactionResult> {
+    const { money, payloadHash } = this.validate(command);
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.uow.run((repos) => this.process(repos, command, money, payloadHash));
+      } catch (error) {
+        if (error instanceof ConcurrentWriteConflictError && attempt < MAX_CONFLICT_RETRIES) continue;
+        throw translateDomainError(error);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------- dentro da transação
+
+  private async process(
+    repos: TransactionalRepositories,
+    command: ProcessWagerTransactionCommand,
+    money: Money,
+    payloadHash: string,
+  ): Promise<WagerTransactionResult> {
+    const { payload } = command;
+    const now = this.clock.now();
+
+    // 1. lock da wallet
+    const wallet = await repos.wallets.findByIdForUpdate(payload.walletId);
+    if (!wallet) throw new WalletNotFoundError(payload.walletId);
+
+    // 2. idempotência (persistente: consulta o banco, nunca memória)
+    const existing = await repos.transactions.findByIdempotencyKey(command.idempotencyKey);
+    if (existing) {
+      const result = replayOrConflict(existing, payloadHash);
+      await this.recordInbox(repos, command, payloadHash, now);
+      return result;
+    }
+
+    // moeda diferente da wallet: a FK (wallet_id, currency) impede gravar como REJECTED
+    if (money.currency !== wallet.currency) {
+      throw new BusinessRuleViolationError(
+        FailureCode.CurrencyMismatch,
+        `wallet ${wallet.id} is ${wallet.currency}, operation is ${money.currency}`,
+      );
+    }
+
+    // 3. decide
+    const tx = WagerTransaction.create({
+      ...payload,
+      id: this.ids.next(),
+      idempotencyKey: command.idempotencyKey,
+      payloadHash,
+      money,
+      createdAt: now,
+    });
+
+    let entry: WalletLedgerEntry | undefined;
+    if (wallet.playerId !== tx.playerId) {
+      tx.reject(FailureCode.WalletPlayerMismatch);
+    } else {
+      entry = await this.decide(repos, tx, wallet, now);
+    }
+
+    // 4. grava (a ordem respeita as FKs: transação -> saldo -> ledger)
+    await repos.transactions.insert(tx);
+    if (entry) {
+      await repos.wallets.update(wallet);
+      await repos.ledger.append(entry);
+    }
+    for (const event of this.eventsFor(tx, wallet, entry, command, now)) {
+      await repos.outbox.add(OutboxMessage.enqueue(event));
+    }
+    await this.recordInbox(repos, command, payloadHash, now);
+
+    return toResult(tx, false);
+  }
+
+  /**
+   * Aplica as regras do tipo de operação. Muda o estado de `tx` (PROCESSED, REJECTED
+   * ou PENDING_REFERENCE) e, quando o saldo muda, devolve o lançamento do ledger.
+   */
+  private async decide(
+    repos: TransactionalRepositories,
+    tx: WagerTransaction,
+    wallet: Wallet,
+    now: Date,
+  ): Promise<WalletLedgerEntry | undefined> {
+    switch (tx.kind) {
+      case Kind.Bet:
+        if (!wallet.canAfford(tx.money)) {
+          tx.reject(FailureCode.InsufficientFunds, wallet.balance);
+          return undefined;
+        }
+        return this.move(tx, wallet, LedgerDirection.Debit, now);
+
+      case Kind.Win:
+        return this.move(tx, wallet, LedgerDirection.Credit, now);
+
+      case Kind.Loss:
+        // registra o resultado da rodada sem mover saldo
+        tx.markProcessed({ observedBalance: wallet.balance, at: now });
+        return undefined;
+
+      case Kind.Refund:
+      case Kind.Rollback:
+        return this.decideReversal(repos, tx, wallet, now);
+
+      default:
+        throw new InvalidPayloadError('INVALID_KIND', `kind ${tx.kind} cannot be processed`);
+    }
+  }
+
+  private async decideReversal(
+    repos: TransactionalRepositories,
+    tx: WagerTransaction,
+    wallet: Wallet,
+    now: Date,
+  ): Promise<WalletLedgerEntry | undefined> {
+    const reference = await repos.transactions.findByProviderAndExternalId(
+      tx.providerId,
+      tx.referenceExternalTransactionId!,
+    );
+
+    // referência ainda não chegou (ou ainda não foi decidida): aguarda o worker (seção 7.1)
+    const check = reference ? tx.checkReference(reference) : { outcome: 'wait' as const };
+    if (check.outcome === 'wait') {
+      const next = this.referencePolicy.nextAttemptAt(tx.attempts, now);
+      if (next) tx.markPendingReference(next);
+      else tx.reject(FailureCode.ReferenceNotFound);
+      return undefined;
+    }
+    if (check.outcome === 'invalid') {
+      tx.reject(check.code);
+      return undefined;
+    }
+
+    const ref = reference!;
+    // regra 7.4: uma referência só é revertida uma vez por tipo de operação
+    // (o índice único parcial no banco garante o mesmo, como última defesa)
+    if (await repos.transactions.hasProcessedReversal(ref.id, tx.kind)) {
+      tx.reject(FailureCode.ReferenceAlreadyReversed);
+      return undefined;
+    }
+
+    const direction = tx.ledgerDirectionFor(ref);
+    // regra 7.9: reversão que negativaria o saldo tem código PRÓPRIO, diferente de BET sem saldo
+    if (direction === LedgerDirection.Debit && !wallet.canAfford(tx.money)) {
+      tx.reject(FailureCode.ReversalWouldOverdraw, wallet.balance);
+      return undefined;
+    }
+    return this.move(tx, wallet, direction, now, ref.id);
+  }
+
+  /** Move o saldo e marca a transação como PROCESSED com o saldo resultante. */
+  private move(
+    tx: WagerTransaction,
+    wallet: Wallet,
+    direction: LedgerDirection,
+    now: Date,
+    referenceTransactionId?: string,
+  ): WalletLedgerEntry {
+    const movement = { entryId: this.ids.next(), transactionId: tx.id, money: tx.money, at: now };
+    const entry = direction === LedgerDirection.Credit ? wallet.credit(movement) : wallet.debit(movement);
+    tx.markProcessed({
+      ...(referenceTransactionId && { referenceTransactionId }),
+      observedBalance: wallet.balance,
+      at: now,
+    });
+    return entry;
+  }
+
+  // ------------------------------------------------------------- eventos e inbox
+
+  private eventsFor(
+    tx: WagerTransaction,
+    wallet: Wallet,
+    entry: WalletLedgerEntry | undefined,
+    command: ProcessWagerTransactionCommand,
+    now: Date,
+  ): IntegrationEvent<unknown>[] {
+    const ctx = (): EventContext => ({
+      eventId: this.ids.next(),
+      correlationId: command.context.correlationId,
+      ...(command.context.causationId !== undefined && { causationId: command.context.causationId }),
+      occurredAt: now,
+    });
+
+    switch (tx.status) {
+      case Status.Processed:
+        return [
+          WagerTransactionProcessed.from(tx, ctx()),
+          ...(entry ? [WalletBalanceChanged.from(wallet, entry, ctx())] : []),
+        ];
+      case Status.Rejected:
+        return [WagerTransactionRejected.from(tx, ctx())];
+      case Status.PendingReference:
+        return [WagerTransactionPendingReference.from(tx, ctx())];
+      default:
+        return [];
+    }
+  }
+
+  private async recordInbox(
+    repos: TransactionalRepositories,
+    command: ProcessWagerTransactionCommand,
+    payloadHash: string,
+    now: Date,
+  ): Promise<void> {
+    if (!command.inbox) return;
+    // redelivery da mesma mensagem: a inbox já registrou; o consumer (dia 3) trata antes de chegar aqui
+    if (await repos.inbox.find(command.inbox.consumerName, command.inbox.messageId)) return;
+    const message = InboxMessage.receive({ ...command.inbox, payloadHash, receivedAt: now });
+    message.markProcessed(now);
+    await repos.inbox.insert(message);
+  }
+
+  // ------------------------------------------------------------- validação de entrada
+
+  /** Falhas aqui viram "payload inválido": nada é gravado e reenviar igual nunca vai funcionar. */
+  private validate(command: ProcessWagerTransactionCommand): { money: Money; payloadHash: string } {
+    const { payload } = command;
+    for (const field of ['walletId', 'playerId'] as const) {
+      if (typeof payload[field] !== 'string' || !UUID.test(payload[field])) {
+        throw new InvalidPayloadError('INVALID_FIELD', `${field} must be a UUID`);
+      }
+    }
+    try {
+      const money = Money.from(payload.money);
+      return { money, payloadHash: hashWagerPayload(payload) };
+    } catch (error) {
+      throw translateDomainError(error);
+    }
+  }
+}
+
+/** Erros de validação do domínio → InvalidPayloadError (a API não precisa conhecer o domínio). */
+function translateDomainError(error: unknown): unknown {
+  if (error instanceof InvalidWagerTransactionError) return new InvalidPayloadError(error.code, error.message);
+  if (error instanceof InvalidMoneyAmountError || error instanceof InvalidCurrencyError) {
+    return new InvalidPayloadError(error.code, error.message);
+  }
+  if (error instanceof TypeError && error.message.startsWith('canonicalJson')) {
+    return new InvalidPayloadError('INVALID_PAYLOAD', error.message);
+  }
+  return error;
+}
