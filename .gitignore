@@ -5,3 +5,5 @@ node_modules/
 temp/
 coverage/
 *.log
+# anotações pessoais de estudo (não fazem parte da entrega)
+estudo/
