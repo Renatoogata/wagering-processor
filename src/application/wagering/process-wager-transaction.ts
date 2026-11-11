@@ -1,9 +1,8 @@
 import { WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected, WalletBalanceChanged, type EventContext, type IntegrationEvent } from '../../domain/events';
 import { InboxMessage, OutboxMessage } from '../../domain/messaging';
-import { InvalidCurrencyError, InvalidMoneyAmountError, Money } from '../../domain/money';
+import { Money } from '../../domain/money';
 import {
   FailureCode,
-  InvalidWagerTransactionError,
   ReferenceRetryPolicy,
   WagerTransaction,
   WagerTransactionKind as Kind,
@@ -12,9 +11,15 @@ import {
   type WagerPayload,
 } from '../../domain/wagering';
 import { LedgerDirection, type Wallet, type WalletLedgerEntry } from '../../domain/wallet';
-import { BusinessRuleViolationError, InvalidPayloadError, WalletNotFoundError } from '../errors';
+import {
+  BusinessRuleViolationError,
+  DuplicateExternalTransactionError,
+  InvalidPayloadError,
+  WalletNotFoundError,
+} from '../errors';
 import { ConcurrentWriteConflictError, type TransactionalRepositories, type UnitOfWork } from '../ports/repositories';
 import type { Clock, IdGenerator } from '../ports/system';
+import { assertUuid, translateValidationError } from '../validation';
 import { replayOrConflict, toResult, type WagerTransactionResult } from './wager-transaction-result';
 
 export interface ProcessWagerTransactionCommand {
@@ -25,8 +30,6 @@ export interface ProcessWagerTransactionCommand {
   /** presente quando a entrada é a SQS: a inbox é gravada na MESMA transação */
   inbox?: { consumerName: string; messageId: string };
 }
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Quantas vezes repetir quando duas transações concorrentes colidem numa constraint única. */
 const MAX_CONFLICT_RETRIES = 3;
@@ -66,7 +69,7 @@ export class ProcessWagerTransaction {
         return await this.uow.run((repos) => this.process(repos, command, money, payloadHash));
       } catch (error) {
         if (error instanceof ConcurrentWriteConflictError && attempt < MAX_CONFLICT_RETRIES) continue;
-        throw translateDomainError(error);
+        throw translateValidationError(error);
       }
     }
   }
@@ -92,6 +95,16 @@ export class ProcessWagerTransaction {
       const result = replayOrConflict(existing, payloadHash);
       await this.recordInbox(repos, command, payloadHash, now);
       return result;
+    }
+
+    // mesmo (provider, externalId) com OUTRA key: não é replay nem operação nova.
+    // Sem este check, o UNIQUE do banco estouraria e o retry repetiria o erro 3x.
+    const sameExternal = await repos.transactions.findByProviderAndExternalId(
+      payload.providerId,
+      payload.externalTransactionId,
+    );
+    if (sameExternal) {
+      throw new DuplicateExternalTransactionError(payload.providerId, payload.externalTransactionId);
     }
 
     // moeda diferente da wallet: a FK (wallet_id, currency) impede gravar como REJECTED
@@ -277,28 +290,16 @@ export class ProcessWagerTransaction {
   /** Falhas aqui viram "payload inválido": nada é gravado e reenviar igual nunca vai funcionar. */
   private validate(command: ProcessWagerTransactionCommand): { money: Money; payloadHash: string } {
     const { payload } = command;
-    for (const field of ['walletId', 'playerId'] as const) {
-      if (typeof payload[field] !== 'string' || !UUID.test(payload[field])) {
-        throw new InvalidPayloadError('INVALID_FIELD', `${field} must be a UUID`);
-      }
+    if (typeof command.idempotencyKey !== 'string' || command.idempotencyKey.length < 1 || command.idempotencyKey.length > 512) {
+      throw new InvalidPayloadError('INVALID_IDEMPOTENCY_KEY', 'idempotency key must have 1 to 512 characters');
     }
+    assertUuid('walletId', payload.walletId);
+    assertUuid('playerId', payload.playerId);
     try {
       const money = Money.from(payload.money);
       return { money, payloadHash: hashWagerPayload(payload) };
     } catch (error) {
-      throw translateDomainError(error);
+      throw translateValidationError(error);
     }
   }
-}
-
-/** Erros de validação do domínio → InvalidPayloadError (a API não precisa conhecer o domínio). */
-function translateDomainError(error: unknown): unknown {
-  if (error instanceof InvalidWagerTransactionError) return new InvalidPayloadError(error.code, error.message);
-  if (error instanceof InvalidMoneyAmountError || error instanceof InvalidCurrencyError) {
-    return new InvalidPayloadError(error.code, error.message);
-  }
-  if (error instanceof TypeError && error.message.startsWith('canonicalJson')) {
-    return new InvalidPayloadError('INVALID_PAYLOAD', error.message);
-  }
-  return error;
 }

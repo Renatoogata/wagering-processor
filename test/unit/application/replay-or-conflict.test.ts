@@ -14,12 +14,12 @@ const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 const HASH = 'a'.repeat(64);
 const OTHER_HASH = 'b'.repeat(64);
 
-function existing() {
+function existing(idempotencyKey = 'provider-a:ext-1') {
   return WagerTransaction.create({
     id: 'tx-1',
     providerId: 'provider-a',
     externalTransactionId: 'ext-1',
-    idempotencyKey: 'provider-a:ext-1',
+    idempotencyKey,
     payloadHash: HASH,
     walletId: 'wallet-1',
     playerId: 'player-1',
@@ -58,14 +58,14 @@ describe('replayOrConflict', () => {
     expect(() => replayOrConflict(tx, OTHER_HASH)).toThrow(IdempotencyConflictError);
   });
 
-  test('o erro de conflito carrega a key', () => {
-    const tx = existing();
+  test('o erro de conflito carrega a key DA TRANSAÇÃO (não um valor fixo)', () => {
+    const tx = existing('provider-z:outra-key-42');
     try {
       replayOrConflict(tx, OTHER_HASH);
       throw new Error('deveria ter lançado');
     } catch (error) {
       expect(error).toBeInstanceOf(IdempotencyConflictError);
-      expect((error as IdempotencyConflictError).idempotencyKey).toBe('provider-a:ext-1');
+      expect((error as IdempotencyConflictError).idempotencyKey).toBe('provider-z:outra-key-42');
     }
   });
 });

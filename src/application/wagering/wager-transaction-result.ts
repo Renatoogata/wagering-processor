@@ -1,6 +1,10 @@
-import type { MoneyProps } from '../../domain/money';
-import type { FailureCode, WagerTransaction, WagerTransactionStatus } from '../../domain/wagering';
-import { IdempotencyConflictError } from '../errors';
+import type { MoneyProps } from "../../domain/money";
+import type {
+  FailureCode,
+  WagerTransaction,
+  WagerTransactionStatus,
+} from "../../domain/wagering";
+import { IdempotencyConflictError } from "../errors";
 
 /** O que a API e o consumer devolvem ao provedor (seção 9, "Submeter transação"). */
 export interface WagerTransactionResult {
@@ -12,7 +16,10 @@ export interface WagerTransactionResult {
   idempotentReplay: boolean;
 }
 
-export function toResult(tx: WagerTransaction, idempotentReplay: boolean): WagerTransactionResult {
+export function toResult(
+  tx: WagerTransaction,
+  idempotentReplay: boolean,
+): WagerTransactionResult {
   return {
     transactionId: tx.id,
     status: tx.status,
@@ -47,8 +54,8 @@ export function toResult(tx: WagerTransaction, idempotentReplay: boolean): Wager
  * Pronto quando: bun test test/unit/application/replay-or-conflict.test.ts passar.
  */
 export function replayOrConflict(existing: WagerTransaction, payloadHash: string): WagerTransactionResult {
-  void existing;
-  void payloadHash;
-  void IdempotencyConflictError;
-  throw new Error('TODO(desafio 4): implementar replayOrConflict');
+  if (!existing.matchesPayload(payloadHash)) {
+    throw new IdempotencyConflictError(existing.idempotencyKey);
+  }
+  return toResult(existing, true);
 }

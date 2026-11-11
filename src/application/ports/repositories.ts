@@ -22,6 +22,9 @@ export interface WalletRepository {
    */
   findByIdForUpdate(id: string): Promise<Wallet | undefined>;
 
+  /** Regra "uma wallet por player + moeda" (o UNIQUE do banco é a última defesa). */
+  findByPlayerAndCurrency(playerId: string, currency: string): Promise<Wallet | undefined>;
+
   insert(wallet: Wallet): Promise<void>;
 
   /** Grava saldo/version/updatedAt. Só deve ser chamado com a linha travada. */
@@ -98,5 +101,17 @@ export class ConcurrentWriteConflictError extends Error {
   constructor(override readonly cause: unknown) {
     super('Concurrent write conflict; the unit of work was rolled back');
     this.name = 'ConcurrentWriteConflictError';
+  }
+}
+
+/**
+ * Falha de infraestrutura que pode passar sozinha (banco fora do ar, conexão caiu,
+ * timeout esperando lock). A operação NÃO foi aplicada (rollback) e reenviar é seguro:
+ * a idempotência garante que, se por acaso tiver sido, o reenvio vira replay.
+ */
+export class TransientInfrastructureError extends Error {
+  constructor(override readonly cause: unknown) {
+    super('Transient infrastructure failure; the operation was not applied and may be retried');
+    this.name = 'TransientInfrastructureError';
   }
 }

@@ -1,7 +1,14 @@
-import { DeadlockException, LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
+import {
+  ConnectionException,
+  DeadlockException,
+  LockMode,
+  LockWaitTimeoutException,
+  UniqueConstraintViolationException,
+} from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import {
   ConcurrentWriteConflictError,
+  TransientInfrastructureError,
   type InboxRepository,
   type LedgerPage,
   type LedgerRepository,
@@ -56,6 +63,11 @@ class MikroOrmWalletRepository implements WalletRepository {
     // SELECT ... FOR UPDATE: a linha fica travada até o commit/rollback.
     // Outra transação que pedir o mesmo lock ESPERA; depois lê o saldo já atualizado.
     const row = await this.em.findOne(WalletRow, { id }, { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true });
+    return row ? walletToDomain(row) : undefined;
+  }
+
+  async findByPlayerAndCurrency(playerId: string, currency: string): Promise<Wallet | undefined> {
+    const row = await this.em.findOne(WalletRow, { playerId, currency });
     return row ? walletToDomain(row) : undefined;
   }
 
@@ -212,7 +224,17 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
       if (error instanceof UniqueConstraintViolationException || error instanceof DeadlockException) {
         throw new ConcurrentWriteConflictError(error);
       }
+      if (isTransient(error)) throw new TransientInfrastructureError(error);
       throw error;
     }
   }
+}
+
+const TRANSIENT_NETWORK_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', '57P01', '53300']);
+
+/** Conexão/lock que pode se resolver sozinho. Erros de lógica e de constraint NÃO entram aqui. */
+function isTransient(error: unknown): boolean {
+  if (error instanceof ConnectionException || error instanceof LockWaitTimeoutException) return true;
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && TRANSIENT_NETWORK_CODES.has(code);
 }
