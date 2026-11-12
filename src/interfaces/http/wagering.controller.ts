@@ -1,6 +1,8 @@
 import { Body, Controller, Get, Headers, Inject, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
 import type { Response } from 'express';
 import { InvalidPayloadError } from '../../application/errors';
+import { APP_LOGGER, METRICS, type AppLogger, type Metrics } from '../../application/ports/observability';
+import { recordWagerOutcome } from '../shared/wager-telemetry';
 import { ProcessWagerTransaction } from '../../application/wagering/process-wager-transaction';
 import { WalletQueries } from '../../application/wallets/wallet-queries';
 import { statusForTransaction } from './error-mapping';
@@ -15,6 +17,8 @@ export class WageringController {
   constructor(
     @Inject(ProcessWagerTransaction) private readonly processWager: ProcessWagerTransaction,
     @Inject(WalletQueries) private readonly queries: WalletQueries,
+    @Inject(METRICS) private readonly metrics: Metrics,
+    @Inject(APP_LOGGER) private readonly logger: AppLogger,
   ) {}
 
   /**
@@ -31,10 +35,15 @@ export class WageringController {
     if (!idempotencyKey) {
       throw new InvalidPayloadError('MISSING_IDEMPOTENCY_KEY', 'Idempotency-Key header is required');
     }
+    const started = performance.now();
+    const payload = toWagerPayload(requireObject(body));
     const result = await this.processWager.execute({
       idempotencyKey,
-      payload: toWagerPayload(requireObject(body)),
+      payload,
       context: { correlationId: req.correlationId },
+    });
+    recordWagerOutcome({ metrics: this.metrics, logger: this.logger }, 'http', payload, result, started, {
+      correlationId: req.correlationId,
     });
     res.status(statusForTransaction(result.status));
     return result;

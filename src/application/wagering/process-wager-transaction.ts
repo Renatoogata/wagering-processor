@@ -20,6 +20,7 @@ import {
   WalletNotFoundError,
 } from '../errors';
 import { ConcurrentWriteConflictError, type TransactionalRepositories, type UnitOfWork } from '../ports/repositories';
+import { noopMetrics, type Metrics } from '../ports/observability';
 import type { Clock, IdGenerator } from '../ports/system';
 import { assertUuid, translateValidationError } from '../validation';
 import { replayOrConflict, toResult, type WagerTransactionResult } from './wager-transaction-result';
@@ -61,6 +62,7 @@ export class ProcessWagerTransaction {
     private readonly clock: Clock,
     private readonly ids: IdGenerator,
     private readonly referencePolicy: ReferenceRetryPolicy = new ReferenceRetryPolicy(),
+    private readonly metrics: Metrics = noopMetrics,
   ) {}
 
   async execute(command: ProcessWagerTransactionCommand): Promise<WagerTransactionResult> {
@@ -86,7 +88,7 @@ export class ProcessWagerTransaction {
       const now = this.clock.now();
 
       // 1. lock da wallet ANTES da transação: mesma ordem do execute() → sem deadlock
-      const wallet = await repos.wallets.findByIdForUpdate(walletId);
+      const wallet = await this.lockWallet(repos, walletId);
       if (!wallet) return undefined;
 
       // 2. relê a transação com a wallet travada: outra instância pode ter resolvido enquanto esperávamos
@@ -121,10 +123,26 @@ export class ProcessWagerTransaction {
       try {
         return await this.uow.run(work);
       } catch (error) {
-        if (error instanceof ConcurrentWriteConflictError && attempt < MAX_CONFLICT_RETRIES) continue;
+        if (error instanceof ConcurrentWriteConflictError) {
+          // métrica "conflitos de lock" (seção 12): colisão em constraint única ou deadlock
+          this.metrics.increment('concurrent_write_conflicts_total', { retried: String(attempt < MAX_CONFLICT_RETRIES) });
+          if (attempt < MAX_CONFLICT_RETRIES) continue;
+        }
         throw translateValidationError(error);
       }
     }
+  }
+
+  /**
+   * SELECT ... FOR UPDATE na wallet, medindo quanto tempo esperou pelo lock.
+   * Numa "hot wallet" (muita operação na mesma wallet) esse tempo sobe: é o
+   * sinal de contenção, mesmo quando nada falha.
+   */
+  private async lockWallet(repos: TransactionalRepositories, walletId: string): Promise<Wallet | undefined> {
+    const started = performance.now();
+    const wallet = await repos.wallets.findByIdForUpdate(walletId);
+    this.metrics.observe('wallet_lock_wait_seconds', (performance.now() - started) / 1000);
+    return wallet;
   }
 
   // ------------------------------------------------------------- dentro da transação
@@ -139,7 +157,7 @@ export class ProcessWagerTransaction {
     const now = this.clock.now();
 
     // 1. lock da wallet
-    const wallet = await repos.wallets.findByIdForUpdate(payload.walletId);
+    const wallet = await this.lockWallet(repos, payload.walletId);
     if (!wallet) throw new WalletNotFoundError(payload.walletId);
 
     // 2a. inbox (só SQS): esta MENSAGEM já foi processada? redelivery → devolve o original

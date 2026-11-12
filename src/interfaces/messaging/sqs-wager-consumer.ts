@@ -11,6 +11,7 @@ import type { ProcessWagerTransaction } from '../../application/wagering/process
 import { classifyFailure, type FailureDecision } from './classify-failure';
 import { parseWagerMessage, type WagerMessage } from './wager-message';
 import type { BackgroundWorker } from '../workers/polling-worker';
+import { recordWagerOutcome } from '../shared/wager-telemetry';
 
 export interface WagerConsumerConfig {
   /** nome deste consumidor na inbox: (consumerName, messageId) */
@@ -165,16 +166,10 @@ export class SqsWagerConsumer implements BackgroundWorker {
       });
 
       // aqui o commit JÁ aconteceu; só agora o ack
-      this.metrics.increment('wager_transactions_total', { channel: 'sqs', status: result.status });
-      if (result.idempotentReplay) this.metrics.increment('wager_duplicates_total', { channel: 'sqs' });
-      this.metrics.observe('wager_processing_seconds', (performance.now() - started) / 1000, { channel: 'sqs' });
-      this.logger.info('sqs message processed', {
-        ...this.logFields(m, parsed),
+      recordWagerOutcome({ metrics: this.metrics, logger: this.logger }, 'sqs', parsed.payload, result, started, {
         correlationId,
-        transactionId: result.transactionId,
-        status: result.status,
-        failureCode: result.failureCode,
-        idempotentReplay: result.idempotentReplay,
+        messageId: parsed.messageId,
+        sqsMessageId: m.MessageId,
         receiveCount,
       });
       await this.ack(m, parsed);

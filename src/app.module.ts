@@ -2,7 +2,9 @@ import { Module } from '@nestjs/common';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { MikroORM, PostgreSqlDriver } from '@mikro-orm/postgresql';
 import { buildOrmConfig } from '../mikro-orm.config';
-import { APP_LOGGER, InMemoryMetrics, METRICS, jsonLogger, type AppLogger, type Metrics } from './application/ports/observability';
+import { APP_LOGGER, InMemoryMetrics, METRICS, OPERATIONAL_GAUGES, jsonLogger, type AppLogger, type Metrics } from './application/ports/observability';
+import { SqlAndSqsGauges } from './infrastructure/observability/operational-gauges';
+import { MetricsController } from './interfaces/http/metrics.controller';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/ports/repositories';
 import { CLOCK, ID_GENERATOR, systemClock, uuidV7Generator, type Clock, type IdGenerator } from './application/ports/system';
 import { ProcessWagerTransaction } from './application/wagering/process-wager-transaction';
@@ -39,7 +41,7 @@ const enabled = (flag: string) => process.env[flag] !== 'false';
     }),
     SqsModule,
   ],
-  controllers: [HealthController, WalletsController, WageringController],
+  controllers: [HealthController, MetricsController, WalletsController, WageringController],
   providers: [
     // ---- adaptadores
     { provide: UNIT_OF_WORK, useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm.em), inject: [MikroORM] },
@@ -47,13 +49,23 @@ const enabled = (flag: string) => process.env[flag] !== 'false';
     { provide: ID_GENERATOR, useValue: uuidV7Generator },
     { provide: APP_LOGGER, useValue: jsonLogger },
     { provide: METRICS, useValue: new InMemoryMetrics() },
+    {
+      provide: OPERATIONAL_GAUGES,
+      useFactory: (orm: MikroORM, sqs: SQSClient) =>
+        new SqlAndSqsGauges(orm.em, sqs, {
+          wagerQueueUrl: process.env.SQS_WAGER_QUEUE_URL,
+          wagerDlqUrl: process.env.SQS_WAGER_DLQ_URL,
+        }),
+      inject: [MikroORM, SQS_CLIENT],
+    },
     ProviderAuthGuard,
 
     // ---- casos de uso
     {
       provide: ProcessWagerTransaction,
-      useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator) => new ProcessWagerTransaction(uow, clock, ids),
-      inject: [UNIT_OF_WORK, CLOCK, ID_GENERATOR],
+      useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator, metrics: Metrics) =>
+        new ProcessWagerTransaction(uow, clock, ids, undefined, metrics),
+      inject: [UNIT_OF_WORK, CLOCK, ID_GENERATOR, METRICS],
     },
     {
       provide: CreateWallet,

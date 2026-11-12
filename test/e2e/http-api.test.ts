@@ -253,3 +253,27 @@ describe('POST /wallets/:id/reconciliation', () => {
     expect((await http.get(`/wallets/${w.walletId}`)).body.balance).toEqual(brl('90.00')); // não corrigiu
   });
 });
+
+describe('GET /metrics (seção 12)', () => {
+  test('formato Prometheus, sem autenticação, com transações por status, duplicatas, latência e outbox lag', async () => {
+    const w = await createWallet('100.00');
+    const body = wager(w);
+    expect((await submit(body)).status).toBe(200);
+    expect((await submit(body)).status).toBe(200); // replay → duplicata
+
+    const res = await fetch(`${app.baseUrl}/metrics`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    const text = await res.text();
+
+    expect(text).toMatch(/^wager_transactions_total\{channel="http",status="PROCESSED"\} \d+$/m);
+    expect(text).toMatch(/^wager_duplicates_total\{channel="http"\} \d+$/m);
+    expect(text).toMatch(/^wager_processing_seconds_count\{channel="http"\} \d+$/m);
+    expect(text).toMatch(/^wallet_lock_wait_seconds_bucket\{le="\+Inf"\} \d+$/m);
+    expect(text).toMatch(/^outbox_pending_messages \d+$/m);
+    expect(text).toMatch(/^outbox_oldest_pending_age_seconds [\d.]+$/m);
+    expect(text).toMatch(/^pending_reference_transactions \d+$/m);
+    expect(text).toMatch(/^sqs_wager_dlq_messages \d+$/m);
+    expect(text).toMatch(/^metrics_collect_errors 0$/m);
+  });
+});
