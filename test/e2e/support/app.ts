@@ -16,6 +16,8 @@ export async function startApp(): Promise<TestApp> {
   const { orm } = await startDatabase(); // garante as migrations aplicadas
   await orm.close();
 
+  // os e2e testam a API; o consumer SQS tem testes próprios com filas isoladas
+  process.env.SQS_CONSUMER_ENABLED = 'false';
   const app = await NestFactory.create(AppModule, { logger: false });
   configureHttp(app);
   await app.listen(0);

@@ -13,6 +13,7 @@ import type { FailureCode } from '../domain/wagering';
  *  - WalletAlreadyExistsError   → já existe wallet para o mesmo player + moeda. Nada gravado.
  *  - DuplicateExternalTransactionError → (provider, externalTransactionId) já usado com OUTRA key.
  *  - TransactionNotFoundError   → consulta de transação inexistente.
+ *  - InboxMessageConflictError  → SQS: messageId já processado com OUTRO conteúdo. Nada gravado.
  *
  * Rejeições que PODEM ser gravadas (saldo insuficiente, referência inválida...) não são erros:
  * viram transação REJECTED com failureCode, e o resultado é devolvido normalmente.
@@ -93,5 +94,21 @@ export class TransactionNotFoundError extends ApplicationError {
 
   constructor(readonly reference: string) {
     super(`Transaction ${reference} not found`);
+  }
+}
+
+/**
+ * Mesmo messageId (SQS) já processado com conteúdo DIFERENTE. Não é redelivery
+ * (redelivery traz exatamente a mesma mensagem): o produtor reaproveitou o id.
+ * Reprocessar nunca vai resolver; a mensagem vai para a DLQ para alguém olhar.
+ */
+export class InboxMessageConflictError extends ApplicationError {
+  readonly code = 'INBOX_MESSAGE_CONFLICT';
+
+  constructor(
+    readonly consumerName: string,
+    readonly messageId: string,
+  ) {
+    super(`Message ${consumerName}/${messageId} was already processed with different content`);
   }
 }

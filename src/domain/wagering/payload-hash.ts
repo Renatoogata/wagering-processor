@@ -60,6 +60,15 @@ export function hashOpeningPayload(p: { walletId: string; playerId: string; mone
   );
 }
 
+/**
+ * Conteúdo de uma mensagem da inbox = "qual key" + "qual operação".
+ * A inbox guarda este hash para detectar o mesmo messageId chegando com conteúdo
+ * diferente (inclusive com a MESMA operação, mas outra idempotency key).
+ */
+export function hashInboxContent(idempotencyKey: string, payloadHash: string): string {
+  return sha256Hex(canonicalJson({ idempotencyKey, payloadHash }));
+}
+
 function sha256Hex(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
 }

@@ -9,12 +9,15 @@ import { ProcessWagerTransaction } from './application/wagering/process-wager-tr
 import { CreateWallet } from './application/wallets/create-wallet';
 import { ReconcileWallet } from './application/wallets/reconcile-wallet';
 import { WalletQueries } from './application/wallets/wallet-queries';
-import { SqsModule } from './infrastructure/messaging/sqs.module';
+import { SQS_CLIENT, SqsModule } from './infrastructure/messaging/sqs.module';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-repositories';
 import { HealthController } from './interfaces/http/health.controller';
 import { ProviderAuthGuard } from './interfaces/http/provider-auth.guard';
 import { WageringController } from './interfaces/http/wagering.controller';
 import { WalletsController } from './interfaces/http/wallets.controller';
+import { SqsConsumerLifecycle, WAGER_CONSUMER } from './interfaces/messaging/sqs-consumer.lifecycle';
+import { SqsWagerConsumer, defaultConsumerConfig } from './interfaces/messaging/sqs-wager-consumer';
+import type { SQSClient } from '@aws-sdk/client-sqs';
 
 /**
  * Composição (o "main" da arquitetura hexagonal): aqui, e só aqui, as portas da
@@ -56,6 +59,19 @@ import { WalletsController } from './interfaces/http/wallets.controller';
       useFactory: (uow: UnitOfWork, logger: AppLogger, metrics: Metrics) => new ReconcileWallet(uow, logger, metrics),
       inject: [UNIT_OF_WORK, APP_LOGGER, METRICS],
     },
+
+    // ---- entrada SQS (mesmo use case da API)
+    {
+      provide: WAGER_CONSUMER,
+      useFactory: (sqs: SQSClient, useCase: ProcessWagerTransaction, logger: AppLogger, metrics: Metrics) => {
+        const queueUrl = process.env.SQS_WAGER_QUEUE_URL;
+        const dlqUrl = process.env.SQS_WAGER_DLQ_URL;
+        if (process.env.SQS_CONSUMER_ENABLED === 'false' || !queueUrl || !dlqUrl) return undefined;
+        return new SqsWagerConsumer(sqs, useCase, defaultConsumerConfig(queueUrl, dlqUrl), logger, metrics);
+      },
+      inject: [SQS_CLIENT, ProcessWagerTransaction, APP_LOGGER, METRICS],
+    },
+    SqsConsumerLifecycle,
   ],
 })
 export class AppModule {}

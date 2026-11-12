@@ -7,6 +7,7 @@ import {
   WagerTransaction,
   WagerTransactionKind as Kind,
   WagerTransactionStatus as Status,
+  hashInboxContent,
   hashWagerPayload,
   type WagerPayload,
 } from '../../domain/wagering';
@@ -14,6 +15,7 @@ import { LedgerDirection, type Wallet, type WalletLedgerEntry } from '../../doma
 import {
   BusinessRuleViolationError,
   DuplicateExternalTransactionError,
+  InboxMessageConflictError,
   InvalidPayloadError,
   WalletNotFoundError,
 } from '../errors';
@@ -40,7 +42,7 @@ const MAX_CONFLICT_RETRIES = 3;
  *
  * Tudo acontece numa única transação SQL, nesta ordem:
  *   1. trava a wallet (SELECT ... FOR UPDATE)            ← fila por wallet
- *   2. idempotência: a key já existe? replay ou conflito ← DEPOIS do lock (ver abaixo)
+ *   2. dedup: a mensagem (inbox) ou a key já existem?    ← DEPOIS do lock (ver abaixo)
  *   3. decide: aplica, rejeita ou deixa pendente
  *   4. grava transação, saldo, ledger, eventos (outbox) e inbox
  *   5. commit — só então a resposta sai
@@ -89,7 +91,11 @@ export class ProcessWagerTransaction {
     const wallet = await repos.wallets.findByIdForUpdate(payload.walletId);
     if (!wallet) throw new WalletNotFoundError(payload.walletId);
 
-    // 2. idempotência (persistente: consulta o banco, nunca memória)
+    // 2a. inbox (só SQS): esta MENSAGEM já foi processada? redelivery → devolve o original
+    const redelivered = await this.checkInbox(repos, command, payloadHash);
+    if (redelivered) return redelivered;
+
+    // 2b. idempotência (persistente: consulta o banco, nunca memória)
     const existing = await repos.transactions.findByIdempotencyKey(command.idempotencyKey);
     if (existing) {
       const result = replayOrConflict(existing, payloadHash);
@@ -271,6 +277,31 @@ export class ProcessWagerTransaction {
     }
   }
 
+  /**
+   * Redelivery da SQS: o mesmo (consumerName, messageId) já está na inbox.
+   *  - mesmo conteúdo → devolve o resultado original como replay (nenhum efeito novo);
+   *  - conteúdo diferente → InboxMessageConflictError (vai para a DLQ).
+   * Roda com a wallet travada: duas cópias da mesma mensagem fazem fila no lock, e a
+   * segunda já enxerga a inbox gravada pela primeira.
+   */
+  private async checkInbox(
+    repos: TransactionalRepositories,
+    command: ProcessWagerTransactionCommand,
+    payloadHash: string,
+  ): Promise<WagerTransactionResult | undefined> {
+    if (!command.inbox) return undefined;
+    const seen = await repos.inbox.find(command.inbox.consumerName, command.inbox.messageId);
+    if (!seen) return undefined;
+
+    if (!seen.matchesPayload(hashInboxContent(command.idempotencyKey, payloadHash))) {
+      throw new InboxMessageConflictError(command.inbox.consumerName, command.inbox.messageId);
+    }
+    // inbox e transação são gravadas no mesmo commit: se uma existe, a outra também
+    const original = await repos.transactions.findByIdempotencyKey(command.idempotencyKey);
+    if (!original) throw new Error(`inbox ${command.inbox.messageId} has no transaction (broken invariant)`);
+    return toResult(original, true);
+  }
+
   private async recordInbox(
     repos: TransactionalRepositories,
     command: ProcessWagerTransactionCommand,
@@ -278,9 +309,13 @@ export class ProcessWagerTransaction {
     now: Date,
   ): Promise<void> {
     if (!command.inbox) return;
-    // redelivery da mesma mensagem: a inbox já registrou; o consumer (dia 3) trata antes de chegar aqui
-    if (await repos.inbox.find(command.inbox.consumerName, command.inbox.messageId)) return;
-    const message = InboxMessage.receive({ ...command.inbox, payloadHash, receivedAt: now });
+    // checkInbox já garantiu que a mensagem é nova; se outra instância gravar a mesma
+    // mensagem em paralelo (outra wallet = outro lock), a PK da inbox barra no commit
+    const message = InboxMessage.receive({
+      ...command.inbox,
+      payloadHash: hashInboxContent(command.idempotencyKey, payloadHash),
+      receivedAt: now,
+    });
     message.markProcessed(now);
     await repos.inbox.insert(message);
   }
