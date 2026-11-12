@@ -67,6 +67,16 @@ export interface InboxRepository {
 
 export interface OutboxRepository {
   add(message: OutboxMessage): Promise<void>;
+
+  /**
+   * Pega até `limit` mensagens pendentes e devidas, em ordem de gravação, TRAVANDO-AS
+   * com SELECT ... FOR UPDATE SKIP LOCKED. Linhas que outro publisher já travou são
+   * PULADAS (não espera): N publishers dividem a fila sem pegar a mesma mensagem.
+   */
+  claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
+
+  /** Grava publishedAt / attempts / nextAttemptAt / lastError. Só com a linha travada. */
+  update(message: OutboxMessage): Promise<void>;
 }
 
 /** Todos os repositórios presos à MESMA transação SQL. */

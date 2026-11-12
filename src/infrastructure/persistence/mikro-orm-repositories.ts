@@ -34,6 +34,7 @@ import {
   inboxToRow,
   ledgerEntryToDomain,
   ledgerEntryToRow,
+  outboxToDomain,
   outboxToRow,
   transactionToDomain,
   transactionToRow,
@@ -191,6 +192,28 @@ class MikroOrmOutboxRepository implements OutboxRepository {
 
   async add(message: OutboxMessage): Promise<void> {
     this.em.create(OutboxMessageRow, outboxToRow(message) as OutboxMessageRow);
+    await this.em.flush();
+  }
+
+  async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+    // usa o índice parcial ix_outbox_pending (next_attempt_at, seq) WHERE published_at IS NULL
+    const rows = await this.em.find(
+      OutboxMessageRow,
+      { publishedAt: null, nextAttemptAt: { $lte: now } },
+      { orderBy: { seq: 'asc' }, limit, lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE, refresh: true },
+    );
+    return rows.map(outboxToDomain);
+  }
+
+  async update(message: OutboxMessage): Promise<void> {
+    const row = await this.em.findOneOrFail(OutboxMessageRow, { id: message.id });
+    const s = outboxToRow(message);
+    this.em.assign(row, {
+      attempts: s.attempts,
+      nextAttemptAt: s.nextAttemptAt,
+      publishedAt: s.publishedAt,
+      lastError: s.lastError,
+    });
     await this.em.flush();
   }
 }

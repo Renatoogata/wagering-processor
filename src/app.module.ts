@@ -15,9 +15,15 @@ import { HealthController } from './interfaces/http/health.controller';
 import { ProviderAuthGuard } from './interfaces/http/provider-auth.guard';
 import { WageringController } from './interfaces/http/wagering.controller';
 import { WalletsController } from './interfaces/http/wallets.controller';
-import { SqsConsumerLifecycle, WAGER_CONSUMER } from './interfaces/messaging/sqs-consumer.lifecycle';
 import { SqsWagerConsumer, defaultConsumerConfig } from './interfaces/messaging/sqs-wager-consumer';
 import type { SQSClient } from '@aws-sdk/client-sqs';
+import { PublishOutboxBatch } from './application/messaging/publish-outbox-batch';
+import { EVENT_PUBLISHER, type EventPublisher } from './application/ports/event-publisher';
+import { SqsEventPublisher } from './infrastructure/messaging/sqs-event-publisher';
+import { PollingWorker, type BackgroundWorker } from './interfaces/workers/polling-worker';
+import { BACKGROUND_WORKERS, WorkersLifecycle } from './interfaces/workers/workers.lifecycle';
+
+const enabled = (flag: string) => process.env[flag] !== 'false';
 
 /**
  * Composição (o "main" da arquitetura hexagonal): aqui, e só aqui, as portas da
@@ -60,18 +66,48 @@ import type { SQSClient } from '@aws-sdk/client-sqs';
       inject: [UNIT_OF_WORK, APP_LOGGER, METRICS],
     },
 
-    // ---- entrada SQS (mesmo use case da API)
+    // ---- mensageria
     {
-      provide: WAGER_CONSUMER,
-      useFactory: (sqs: SQSClient, useCase: ProcessWagerTransaction, logger: AppLogger, metrics: Metrics) => {
+      provide: EVENT_PUBLISHER,
+      useFactory: (sqs: SQSClient) =>
+        new SqsEventPublisher(sqs, process.env.SQS_EVENTS_QUEUE_URL ?? 'http://localhost:4566/000000000000/wagering-events.fifo'),
+      inject: [SQS_CLIENT],
+    },
+    {
+      provide: PublishOutboxBatch,
+      useFactory: (uow: UnitOfWork, publisher: EventPublisher, clock: Clock, logger: AppLogger, metrics: Metrics) =>
+        new PublishOutboxBatch(uow, publisher, clock, logger, metrics),
+      inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK, APP_LOGGER, METRICS],
+    },
+
+    // ---- workers em segundo plano (ordem = ordem de parada no SIGTERM)
+    {
+      provide: BACKGROUND_WORKERS,
+      useFactory: (
+        sqs: SQSClient,
+        processWager: ProcessWagerTransaction,
+        publishOutbox: PublishOutboxBatch,
+        logger: AppLogger,
+        metrics: Metrics,
+      ): BackgroundWorker[] => {
+        const workers: BackgroundWorker[] = [];
         const queueUrl = process.env.SQS_WAGER_QUEUE_URL;
         const dlqUrl = process.env.SQS_WAGER_DLQ_URL;
-        if (process.env.SQS_CONSUMER_ENABLED === 'false' || !queueUrl || !dlqUrl) return undefined;
-        return new SqsWagerConsumer(sqs, useCase, defaultConsumerConfig(queueUrl, dlqUrl), logger, metrics);
+        // entrada SQS: mesmo use case da API
+        if (enabled('SQS_CONSUMER_ENABLED') && queueUrl && dlqUrl) {
+          workers.push(new SqsWagerConsumer(sqs, processWager, defaultConsumerConfig(queueUrl, dlqUrl), logger, metrics));
+        }
+        // relay da outbox: por último, para escoar os eventos das últimas mensagens
+        if (enabled('OUTBOX_PUBLISHER_ENABLED')) {
+          workers.push(
+            new PollingWorker('outbox-publisher', async () => (await publishOutbox.execute()).claimed, { idleDelayMs: 500, errorDelayMs: 2_000 }, logger),
+          );
+        }
+        return workers;
       },
-      inject: [SQS_CLIENT, ProcessWagerTransaction, APP_LOGGER, METRICS],
+      inject: [SQS_CLIENT, ProcessWagerTransaction, PublishOutboxBatch, APP_LOGGER, METRICS],
     },
-    SqsConsumerLifecycle,
+    WorkersLifecycle,
   ],
 })
 export class AppModule {}

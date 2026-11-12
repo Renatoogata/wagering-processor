@@ -10,6 +10,7 @@ import type { AppLogger, Metrics } from '../../application/ports/observability';
 import type { ProcessWagerTransaction } from '../../application/wagering/process-wager-transaction';
 import { classifyFailure, type FailureDecision } from './classify-failure';
 import { parseWagerMessage, type WagerMessage } from './wager-message';
+import type { BackgroundWorker } from '../workers/polling-worker';
 
 export interface WagerConsumerConfig {
   /** nome deste consumidor na inbox: (consumerName, messageId) */
@@ -58,7 +59,8 @@ export type WagerProcessor = Pick<ProcessWagerTransaction, 'execute'>;
  * processar a próxima antes da anterior quebraria a ordem do grupo.
  * Grupos diferentes rodam em paralelo; o lock por wallet cuida do resto.
  */
-export class SqsWagerConsumer {
+export class SqsWagerConsumer implements BackgroundWorker {
+  readonly name = 'sqs-wager-consumer';
   private running = false;
   private loop: Promise<void> | undefined;
   private abort = new AbortController();
