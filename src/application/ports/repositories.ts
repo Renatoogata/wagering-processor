@@ -37,6 +37,13 @@ export interface WagerTransactionRepository {
   findByProviderAndExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
   /** Já existe uma reversão PROCESSED deste tipo para esta referência? (regra 7.4) */
   hasProcessedReversal(referenceTransactionId: string, kind: WagerTransactionKind): Promise<boolean>;
+  /**
+   * Relê a transação TRAVANDO a linha (FOR UPDATE). Usado pelo worker de pendentes
+   * DEPOIS de travar a wallet (mesma ordem de locks do fluxo principal: sem deadlock).
+   */
+  findByIdForUpdate(id: string): Promise<WagerTransaction | undefined>;
+  /** Ids de PENDING_REFERENCE cuja próxima tentativa já venceu (índice parcial), mais antigas primeiro. */
+  findDuePendingReferences(now: Date, limit: number): Promise<{ id: string; walletId: string }[]>;
   insert(tx: WagerTransaction): Promise<void>;
   /** Grava as transições de estado (status, failureCode, observedBalance, attempts...). */
   update(tx: WagerTransaction): Promise<void>;

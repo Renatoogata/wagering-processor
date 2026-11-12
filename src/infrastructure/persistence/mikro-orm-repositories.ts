@@ -111,6 +111,22 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
     return count > 0;
   }
 
+  async findByIdForUpdate(id: string): Promise<WagerTransaction | undefined> {
+    // refresh: ignora o identity map (a linha pode ter mudado enquanto esperávamos o lock)
+    const row = await this.em.findOne(WagerTransactionRow, { id }, { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true });
+    return row ? transactionToDomain(row) : undefined;
+  }
+
+  async findDuePendingReferences(now: Date, limit: number): Promise<{ id: string; walletId: string }[]> {
+    // usa o índice parcial ix_wager_tx_pending_reference (next_attempt_at) WHERE status = 'PENDING_REFERENCE'
+    const rows = await this.em.find(
+      WagerTransactionRow,
+      { status: WagerTransactionStatus.PendingReference, nextAttemptAt: { $lte: now } },
+      { orderBy: { nextAttemptAt: 'asc' }, limit, fields: ['id', 'walletId'] },
+    );
+    return rows.map((r) => ({ id: r.id, walletId: r.walletId }));
+  }
+
   async insert(tx: WagerTransaction): Promise<void> {
     this.em.create(WagerTransactionRow, transactionToRow(tx, tx.createdAt));
     await this.em.flush();

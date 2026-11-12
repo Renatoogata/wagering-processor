@@ -18,6 +18,7 @@ import { WalletsController } from './interfaces/http/wallets.controller';
 import { SqsWagerConsumer, defaultConsumerConfig } from './interfaces/messaging/sqs-wager-consumer';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 import { PublishOutboxBatch } from './application/messaging/publish-outbox-batch';
+import { ResolveDuePendingReferences } from './application/wagering/resolve-due-pending-references';
 import { EVENT_PUBLISHER, type EventPublisher } from './application/ports/event-publisher';
 import { SqsEventPublisher } from './infrastructure/messaging/sqs-event-publisher';
 import { PollingWorker, type BackgroundWorker } from './interfaces/workers/polling-worker';
@@ -80,6 +81,13 @@ const enabled = (flag: string) => process.env[flag] !== 'false';
       inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK, APP_LOGGER, METRICS],
     },
 
+    {
+      provide: ResolveDuePendingReferences,
+      useFactory: (uow: UnitOfWork, processWager: ProcessWagerTransaction, clock: Clock, logger: AppLogger, metrics: Metrics) =>
+        new ResolveDuePendingReferences(uow, processWager, clock, logger, metrics),
+      inject: [UNIT_OF_WORK, ProcessWagerTransaction, CLOCK, APP_LOGGER, METRICS],
+    },
+
     // ---- workers em segundo plano (ordem = ordem de parada no SIGTERM)
     {
       provide: BACKGROUND_WORKERS,
@@ -87,6 +95,7 @@ const enabled = (flag: string) => process.env[flag] !== 'false';
         sqs: SQSClient,
         processWager: ProcessWagerTransaction,
         publishOutbox: PublishOutboxBatch,
+        resolvePending: ResolveDuePendingReferences,
         logger: AppLogger,
         metrics: Metrics,
       ): BackgroundWorker[] => {
@@ -97,6 +106,12 @@ const enabled = (flag: string) => process.env[flag] !== 'false';
         if (enabled('SQS_CONSUMER_ENABLED') && queueUrl && dlqUrl) {
           workers.push(new SqsWagerConsumer(sqs, processWager, defaultConsumerConfig(queueUrl, dlqUrl), logger, metrics));
         }
+        // REFUND/ROLLBACK que chegaram antes da referência (gera eventos: para antes do relay)
+        if (enabled('PENDING_REFERENCE_WORKER_ENABLED')) {
+          workers.push(
+            new PollingWorker('pending-reference-worker', () => resolvePending.execute(), { idleDelayMs: 1_000, errorDelayMs: 2_000 }, logger),
+          );
+        }
         // relay da outbox: por último, para escoar os eventos das últimas mensagens
         if (enabled('OUTBOX_PUBLISHER_ENABLED')) {
           workers.push(
@@ -105,7 +120,7 @@ const enabled = (flag: string) => process.env[flag] !== 'false';
         }
         return workers;
       },
-      inject: [SQS_CLIENT, ProcessWagerTransaction, PublishOutboxBatch, APP_LOGGER, METRICS],
+      inject: [SQS_CLIENT, ProcessWagerTransaction, PublishOutboxBatch, ResolveDuePendingReferences, APP_LOGGER, METRICS],
     },
     WorkersLifecycle,
   ],

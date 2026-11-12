@@ -65,10 +65,61 @@ export class ProcessWagerTransaction {
 
   async execute(command: ProcessWagerTransactionCommand): Promise<WagerTransactionResult> {
     const { money, payloadHash } = this.validate(command);
+    return this.inTransaction((repos) => this.process(repos, command, money, payloadHash));
+  }
 
+  /**
+   * Nova tentativa de uma transação PENDING_REFERENCE (chamado pelo worker, seção 7.1).
+   * Usa EXATAMENTE a mesma regra de reversão do caminho principal (`decideReversal`).
+   *
+   * Resultado:
+   *  - referência chegou e é válida → PROCESSED, saldo e ledger mudam, eventos na outbox;
+   *  - referência chegou e é inválida → REJECTED com o código da regra;
+   *  - ainda não chegou → continua PENDING_REFERENCE com o próximo horário (backoff);
+   *  - limite de tentativas → REJECTED REFERENCE_NOT_FOUND + WagerTransactionRejected.
+   *
+   * Devolve `undefined` quando não havia nada a fazer: outra instância já resolveu,
+   * ou a tentativa ainda não venceu. Por isso dois workers na mesma transação são seguros.
+   */
+  async resolvePendingReference(transactionId: string, walletId: string): Promise<WagerTransactionResult | undefined> {
+    return this.inTransaction(async (repos) => {
+      const now = this.clock.now();
+
+      // 1. lock da wallet ANTES da transação: mesma ordem do execute() → sem deadlock
+      const wallet = await repos.wallets.findByIdForUpdate(walletId);
+      if (!wallet) return undefined;
+
+      // 2. relê a transação com a wallet travada: outra instância pode ter resolvido enquanto esperávamos
+      const tx = await repos.transactions.findByIdForUpdate(transactionId);
+      if (!tx || tx.status !== Status.PendingReference) return undefined;
+      if (tx.nextAttemptAt && tx.nextAttemptAt.getTime() > now.getTime()) return undefined;
+
+      // 3. mesma decisão do caminho principal
+      const entry = await this.decideReversal(repos, tx, wallet, now);
+
+      // 4. grava (transação já existe: update; depois saldo e ledger)
+      await repos.transactions.update(tx);
+      if (entry) {
+        await repos.wallets.update(wallet);
+        await repos.ledger.append(entry);
+      }
+      // eventos só no desfecho: "ainda pendente" de novo não interessa a ninguém
+      if (tx.status !== Status.PendingReference) {
+        // a transação não guarda o correlationId da chamada original: o id dela liga os eventos
+        const context = { correlationId: tx.id, causationId: tx.id };
+        for (const event of this.eventsFor(tx, wallet, entry, context, now)) {
+          await repos.outbox.add(OutboxMessage.enqueue(event));
+        }
+      }
+      return toResult(tx, false);
+    });
+  }
+
+  /** Roda numa transação e repete quando duas transações concorrentes colidem numa constraint única. */
+  private async inTransaction<T>(work: (repos: TransactionalRepositories) => Promise<T>): Promise<T> {
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.uow.run((repos) => this.process(repos, command, money, payloadHash));
+        return await this.uow.run(work);
       } catch (error) {
         if (error instanceof ConcurrentWriteConflictError && attempt < MAX_CONFLICT_RETRIES) continue;
         throw translateValidationError(error);
@@ -144,7 +195,7 @@ export class ProcessWagerTransaction {
       await repos.wallets.update(wallet);
       await repos.ledger.append(entry);
     }
-    for (const event of this.eventsFor(tx, wallet, entry, command, now)) {
+    for (const event of this.eventsFor(tx, wallet, entry, command.context, now)) {
       await repos.outbox.add(OutboxMessage.enqueue(event));
     }
     await this.recordInbox(repos, command, payloadHash, now);
@@ -252,13 +303,13 @@ export class ProcessWagerTransaction {
     tx: WagerTransaction,
     wallet: Wallet,
     entry: WalletLedgerEntry | undefined,
-    command: ProcessWagerTransactionCommand,
+    context: ProcessWagerTransactionCommand['context'],
     now: Date,
   ): IntegrationEvent<unknown>[] {
     const ctx = (): EventContext => ({
       eventId: this.ids.next(),
-      correlationId: command.context.correlationId,
-      ...(command.context.causationId !== undefined && { causationId: command.context.causationId }),
+      correlationId: context.correlationId,
+      ...(context.causationId !== undefined && { causationId: context.causationId }),
       occurredAt: now,
     });
 

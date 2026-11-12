@@ -19,6 +19,7 @@ export async function startApp(): Promise<TestApp> {
   // os e2e testam a API; consumer e publisher têm testes próprios com filas isoladas
   process.env.SQS_CONSUMER_ENABLED = 'false';
   process.env.OUTBOX_PUBLISHER_ENABLED = 'false';
+  process.env.PENDING_REFERENCE_WORKER_ENABLED = 'false';
   const app = await NestFactory.create(AppModule, { logger: false });
   configureHttp(app);
   await app.listen(0);
