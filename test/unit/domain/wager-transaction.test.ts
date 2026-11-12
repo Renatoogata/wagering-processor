@@ -73,6 +73,12 @@ describe('WagerTransaction.create', () => {
     expect(tx({ kind, referenceExternalTransactionId: 'ext-original' }).requiresReference()).toBe(true);
   });
 
+  test('WIN pode trazer a BET como referência (informativa, seção 7)', () => {
+    const win = tx({ kind: Kind.Win, referenceExternalTransactionId: 'bet-1' });
+    expect(win.referenceExternalTransactionId).toBe('bet-1');
+    expect(win.requiresReference()).toBe(false);
+  });
+
   test('LOSS aceita valor zero (registra resultado, não move saldo)', () => {
     expect(tx({ kind: Kind.Loss, money: brl('0.00') }).money.isZero()).toBe(true);
   });
@@ -83,7 +89,7 @@ describe('WagerTransaction.create', () => {
     ['REFUND sem referência', { kind: Kind.Refund }, 'REFERENCE_REQUIRED'],
     ['ROLLBACK com referência vazia', { kind: Kind.Rollback, referenceExternalTransactionId: '  ' }, 'REFERENCE_REQUIRED'],
     ['BET com referência', { referenceExternalTransactionId: 'ext-x' }, 'REFERENCE_NOT_ALLOWED'],
-    ['WIN com referência', { kind: Kind.Win, referenceExternalTransactionId: 'ext-x' }, 'REFERENCE_NOT_ALLOWED'],
+    ['LOSS com referência', { kind: Kind.Loss, money: brl('0.00'), referenceExternalTransactionId: 'ext-x' }, 'REFERENCE_NOT_ALLOWED'],
     [
       'referência a si mesma',
       { kind: Kind.Refund, externalTransactionId: 'same', referenceExternalTransactionId: 'same' },

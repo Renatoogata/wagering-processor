@@ -467,7 +467,9 @@ export class WagerTransaction {
         `${p.kind} requires referenceExternalTransactionId`,
       );
     }
-    if (!needsReference && p.referenceExternalTransactionId !== undefined) {
+    // WIN PODE trazer a BET como referência (seção 7), só informativa: gravada, não resolvida
+    const mayHaveReference = needsReference || p.kind === WagerTransactionKind.Win;
+    if (!mayHaveReference && p.referenceExternalTransactionId !== undefined) {
       throw new InvalidWagerTransactionError(
         "REFERENCE_NOT_ALLOWED",
         `${p.kind} must not have a reference`,

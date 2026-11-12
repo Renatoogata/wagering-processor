@@ -151,6 +151,13 @@ describe('REFUND e ROLLBACK', () => {
     expect((await expectWalletMatchesLedger(uow, wallet.id)).amount).toBe('20.00');
   });
 
+  test('WIN com referência à BET: credita, guarda a referência e não exige que ela exista', async () => {
+    const wallet = await openWallet(uow, '100.00');
+    const result = await useCase.execute(command(wallet, Kind.Win, '40.00', { referenceExternalTransactionId: id() }));
+    expect(result.status).toBe(Status.Processed);
+    expect((await expectWalletMatchesLedger(uow, wallet.id)).amount).toBe('140.00');
+  });
+
   test('REFUND antes da BET: PENDING_REFERENCE + evento', async () => {
     const wallet = await openWallet(uow, '100.00');
     const result = await useCase.execute(

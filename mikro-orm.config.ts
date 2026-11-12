@@ -2,6 +2,7 @@ import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
 import { persistenceEntities } from './src/infrastructure/persistence/entities';
 import { Migration20261110000000_initial_schema } from './src/infrastructure/persistence/migrations/Migration20261110000000_initial_schema';
+import { Migration20261112000000_win_optional_reference } from './src/infrastructure/persistence/migrations/Migration20261112000000_win_optional_reference';
 
 /**
  * Lista explícita de migrations (em vez de glob em disco): funciona igual no Bun,
@@ -9,6 +10,7 @@ import { Migration20261110000000_initial_schema } from './src/infrastructure/per
  */
 export const migrationsList = [
   { name: 'Migration20261110000000_initial_schema', class: Migration20261110000000_initial_schema },
+  { name: 'Migration20261112000000_win_optional_reference', class: Migration20261112000000_win_optional_reference },
 ];
 
 export function buildOrmConfig(databaseUrl = process.env.DATABASE_URL) {
