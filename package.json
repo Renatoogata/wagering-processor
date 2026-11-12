@@ -11,7 +11,9 @@
     "db:rollback": "bun run scripts/migrate.ts down",
     "test": "bun test",
     "test:unit": "bun test test/unit",
-    "test:integration": "bun test test/integration"
+    "test:integration": "bun test test/integration",
+    "test:e2e": "bun test test/e2e",
+    "test:concurrency": "bun test test/concurrency"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1165.0",

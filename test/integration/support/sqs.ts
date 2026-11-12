@@ -27,7 +27,12 @@ export interface TestQueues {
   destroy(): Promise<void>;
 }
 
-export async function createTestQueues(sqs: SQSClient, prefix: string, maxReceiveCount = 10): Promise<TestQueues> {
+export async function createTestQueues(
+  sqs: SQSClient,
+  prefix: string,
+  maxReceiveCount = 10,
+  visibilityTimeoutSeconds = 30,
+): Promise<TestQueues> {
   const suffix = crypto.randomUUID().slice(0, 8);
   const dlq = await sqs.send(
     new CreateQueueCommand({ QueueName: `${prefix}-${suffix}-dlq.fifo`, Attributes: { FifoQueue: 'true' } }),
@@ -40,7 +45,7 @@ export async function createTestQueues(sqs: SQSClient, prefix: string, maxReceiv
       QueueName: `${prefix}-${suffix}.fifo`,
       Attributes: {
         FifoQueue: 'true',
-        VisibilityTimeout: '30',
+        VisibilityTimeout: String(visibilityTimeoutSeconds),
         RedrivePolicy: JSON.stringify({
           deadLetterTargetArn: dlqArn.Attributes!.QueueArn,
           maxReceiveCount: String(maxReceiveCount),
